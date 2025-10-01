@@ -93,6 +93,7 @@ fn main() -> Result<(), Box<dyn Error>> {
 
         while let Some(rem) = NonZeroUsize::new(remaining_frames) {
             let frames = CHUNK_SIZE_FRAMES.min(rem);
+            remaining_frames -= frames.get();
 
             let Ok(mut write_chunk) =
                 tx.write_chunk_uninit(num_ports.checked_mul(frames).unwrap().get())
@@ -120,8 +121,6 @@ fn main() -> Result<(), Box<dyn Error>> {
             }
 
             unsafe { write_chunk.commit_all() };
-
-            remaining_frames -= frames.get();
 
             if rb_size_samples.get() - tx.slots() >= net_chunk_size_spls.get() {
                 network_thread.unpark();
