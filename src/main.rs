@@ -5,6 +5,7 @@ use core::{
     num::NonZeroUsize,
     ptr::NonNull,
 };
+use std::sync::atomic::{AtomicBool, Ordering};
 
 fn as_bytes<T>(data: &[T]) -> &[u8] {
     // SAFETY: all bit patterns for u8 are valid, references have same lifetime and location
@@ -47,6 +48,8 @@ impl JackBufPtr {
 unsafe impl Send for JackBufPtr {}
 unsafe impl Sync for JackBufPtr {}
 
+static READ_FROM_BUF: AtomicBool = AtomicBool::new(false);
+
 fn main() -> Result<(), Box<dyn Error>> {
     let mut args = std::env::args().skip(1);
 
@@ -84,51 +87,60 @@ fn main() -> Result<(), Box<dyn Error>> {
     let mut port_buf_ptrs =
         Box::from_iter(iter::repeat_with(JackBufPtr::dangling).take(num_ports.get()));
 
-    let writer_async_client = jack::contrib::ClosureProcessHandler::new(move |_client, scope| {
-        let mut remaining_frames = scope.n_frames() as usize;
+    let writer_async_client = jack::contrib::ClosureProcessHandler::with_state(
+        (),
+        move |_, _client, scope| {
+            READ_FROM_BUF.store(true, Ordering::Release);
 
-        for (port, ptr) in ports.iter().zip(&mut port_buf_ptrs) {
-            *ptr = JackBufPtr::from_slice(port.as_slice(scope));
-        }
+            let mut remaining_frames = scope.n_frames() as usize;
 
-        while let Some(rem) = NonZeroUsize::new(remaining_frames) {
-            let frames = CHUNK_SIZE_FRAMES.min(rem);
-            remaining_frames -= frames.get();
+            for (port, ptr) in ports.iter().zip(&mut port_buf_ptrs) {
+                *ptr = JackBufPtr::from_slice(port.as_slice(scope));
+            }
 
-            let Ok(mut write_chunk) =
-                tx.write_chunk_uninit(num_ports.checked_mul(frames).unwrap().get())
-            else {
-                continue;
-            };
+            while let Some(rem) = NonZeroUsize::new(remaining_frames) {
+                let frames = CHUNK_SIZE_FRAMES.min(rem);
+                remaining_frames -= frames.get();
 
-            let (start, end) = write_chunk.as_mut_slices();
+                let Ok(mut write_chunk) =
+                    tx.write_chunk_uninit(num_ports.checked_mul(frames).unwrap().get())
+                else {
+                    continue;
+                };
 
-            let mut rb_chunk_iter = start.iter_mut().chain(end);
+                let (start, end) = write_chunk.as_mut_slices();
 
-            for _i in 0..frames.get() {
-                // deinterleave chunk contents
+                let mut rb_chunk_iter = start.iter_mut().chain(end);
 
-                for buf in &mut port_buf_ptrs {
-                    // SAFETY: buf is valid, and within the actual buffer's bounds
-                    let sample = unsafe { buf.read() };
+                for _i in 0..frames.get() {
+                    // deinterleave chunk contents
 
-                    // SAFETY: this happens at most `frames` times, guaranteeing this stays within
-                    // the buffer's bounds
-                    *buf = unsafe { buf.increment() };
+                    for buf in &mut port_buf_ptrs {
+                        // SAFETY: buf is valid, and within the actual buffer's bounds
+                        let sample = unsafe { buf.read() };
 
-                    rb_chunk_iter.next().unwrap().write(sample);
+                        // SAFETY: this happens at most `frames` times, guaranteeing this
+                        // stays within the buffer's bounds
+                        *buf = unsafe { buf.increment() };
+
+                        rb_chunk_iter.next().unwrap().write(sample);
+                    }
+                }
+
+                unsafe { write_chunk.commit_all() };
+
+                if rb_size_samples.get() - tx.slots() >= net_chunk_size_spls.get() {
+                    network_thread.unpark();
                 }
             }
 
-            unsafe { write_chunk.commit_all() };
-
-            if rb_size_samples.get() - tx.slots() >= net_chunk_size_spls.get() {
-                network_thread.unpark();
-            }
-        }
-
-        jack::Control::Continue
-    });
+            jack::Control::Continue
+        },
+        |_, _client, _n_frames| {
+            READ_FROM_BUF.store(false, Ordering::Release);
+            jack::Control::Continue
+        },
+    );
 
     let _active_client = jack_client.activate_async((), writer_async_client).unwrap();
 
@@ -138,13 +150,15 @@ fn main() -> Result<(), Box<dyn Error>> {
             continue;
         };
 
-        // The other half is empty since RB_SIZE % CHUNK_SIZE = 0
-        let (slice, _) = read_chunk.as_slices();
+        if READ_FROM_BUF.load(Ordering::Acquire) {
+            // The other half is empty since always write in chunks of net_chunk_size_spls
+            let (slice, _) = read_chunk.as_slices();
 
-        // println!("{}", slice.iter().copied().map(f32::abs).max_by(f32::total_cmp).unwrap());
-        let slice = as_bytes(slice);
+            // println!("{}", slice.iter().copied().map(f32::abs).max_by(f32::total_cmp).unwrap());
+            let slice = as_bytes(slice);
 
-        socket.send_to(slice, &addr).unwrap();
+            socket.send_to(slice, &addr).unwrap();
+        }
 
         read_chunk.commit_all();
     }
