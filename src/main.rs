@@ -90,7 +90,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     let writer_async_client = jack::contrib::ClosureProcessHandler::with_state(
         (),
         move |_, _client, scope| {
-            READ_FROM_BUF.store(true, Ordering::Release);
+            READ_FROM_BUF.store(true, Ordering::Relaxed);
 
             let mut remaining_frames = scope.n_frames() as usize;
 
@@ -137,7 +137,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             jack::Control::Continue
         },
         |_, _client, _n_frames| {
-            READ_FROM_BUF.store(false, Ordering::Release);
+            READ_FROM_BUF.store(false, Ordering::Relaxed);
             jack::Control::Continue
         },
     );
@@ -150,7 +150,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             continue;
         };
 
-        if READ_FROM_BUF.load(Ordering::Acquire) {
+        if READ_FROM_BUF.load(Ordering::Relaxed) {
             // The other half is empty since always write in chunks of net_chunk_size_spls
             let (slice, _) = read_chunk.as_slices();
 
