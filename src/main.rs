@@ -1,11 +1,12 @@
 use core::{
+    cmp,
     error::Error,
     iter,
     net::{IpAddr, Ipv4Addr},
-    num::NonZeroUsize,
+    num,
     ptr::NonNull,
 };
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::io::{self, Read, Write};
 
 fn as_bytes<T>(data: &[T]) -> &[u8] {
     // SAFETY: all bit patterns for u8 are valid, references have same lifetime and location
@@ -13,23 +14,23 @@ fn as_bytes<T>(data: &[T]) -> &[u8] {
 }
 
 const PORT: u16 = 6910;
-const CHUNK_SIZE_FRAMES: NonZeroUsize = NonZeroUsize::new(1 << 3).unwrap();
-const RB_NUM_CHUNKS: NonZeroUsize = NonZeroUsize::new(1 << 8).unwrap();
+const RB_MIN_NUM_FRAMES: num::NonZeroUsize = num::NonZeroUsize::new(1 << 9).unwrap();
 
-const DEFAULT_NUM_PORTS: NonZeroUsize = NonZeroUsize::MIN;
+// 1
+const DEFAULT_NUM_PORTS: num::NonZeroUsize = num::NonZeroUsize::MIN;
 
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 struct JackBufPtr(NonNull<f32>);
 
 impl JackBufPtr {
     #[inline]
-    pub const unsafe fn increment(self) -> Self {
-        Self(unsafe { self.0.add(1) })
+    pub const unsafe fn increment(&mut self) {
+        *self = Self(unsafe { self.0.add(1) })
     }
 
     #[inline]
-    pub const unsafe fn read(self) -> f32 {
-        // We're converting to a reference here, instead of using buf.read()
+    pub const unsafe fn read(&self) -> f32 {
+        // We're converting to a reference here, instead of using self.0.read()
         // to make it clear to the optimizer that we have read-only access
         *unsafe { self.0.as_ref() }
     }
@@ -48,16 +49,52 @@ impl JackBufPtr {
 unsafe impl Send for JackBufPtr {}
 unsafe impl Sync for JackBufPtr {}
 
-static READ_FROM_BUF: AtomicBool = AtomicBool::new(false);
+fn read_exact_array<const N: usize>(reader: &mut (impl Read + ?Sized)) -> io::Result<[u8; N]> {
+    let mut buf = [0; N];
+    reader.read_exact(&mut buf).map(|()| buf)
+}
+
+fn request_connection_to_syfala_server(
+    addr: &core::net::SocketAddr,
+    num_ports: &mut usize,
+) -> io::Result<(num::NonZeroUsize, std::net::TcpStream)> {
+    println!("Attempting to connect to SyFaLa Server at {addr}...");
+    let mut stream = std::net::TcpStream::connect(&addr)?;
+    stream.set_nodelay(true)?;
+
+    println!("Success!\n");
+
+    println!("Requesting {num_ports} ports...");
+    stream.write_all(&num_ports.to_be_bytes())?;
+
+    let num_available_ports = usize::from_be_bytes(read_exact_array(&mut stream)?);
+
+    match num_available_ports.cmp(num_ports) {
+        cmp::Ordering::Less => {
+            println!("WARNING: server inputs overflow, found {num_available_ports} ports instead\n")
+        }
+        cmp::Ordering::Equal => println!("Accepted!\n"),
+        _ => unreachable!("INTERNAL ERROR: server returned invalid port count"),
+    }
+
+    *num_ports = num_available_ports;
+
+    let chunk_size_frames = num::NonZeroUsize::new(usize::from_be_bytes(read_exact_array(&mut stream)?))
+        .expect("INTERNAL ERROR: Server returned a chunk size of 0 frames");
+
+    println!("Server requested {chunk_size_frames} frames of buffering\n");
+
+    Ok((chunk_size_frames, stream))
+}
 
 fn main() -> Result<(), Box<dyn Error>> {
     let mut args = std::env::args().skip(1);
 
-    let num_ports = args
+    let mut num_ports = args
         .next()
         .as_deref()
-        .map(str::parse)
-        .unwrap_or(Ok(DEFAULT_NUM_PORTS))?;
+        .map(|s| s.parse().unwrap())
+        .unwrap_or(DEFAULT_NUM_PORTS.get());
 
     let addr = core::net::SocketAddr::new(
         args.next()
@@ -67,18 +104,38 @@ fn main() -> Result<(), Box<dyn Error>> {
         PORT,
     );
 
-    let net_chunk_size_spls = CHUNK_SIZE_FRAMES.checked_mul(num_ports).unwrap();
-    let rb_size_samples = net_chunk_size_spls.checked_mul(RB_NUM_CHUNKS).unwrap();
-    let (mut tx, mut rx) = rtrb::RingBuffer::new(rb_size_samples.get());
+    let (chunk_size, stream) = request_connection_to_syfala_server(&addr, &mut num_ports)?;
+    let Some(num_ports) = num::NonZeroUsize::new(num_ports) else {
+        return Err("ERROR: creating a client with 0 ports".into());
+    };
 
-    let socket = std::net::UdpSocket::bind("0.0.0.0:0").unwrap();
+    println!("Creating UDP Socket...");
+    let socket = std::net::UdpSocket::bind(stream.local_addr().unwrap()).unwrap();
+    socket.connect(&addr)?;
+    println!("Success!\n");
+
+    let chunk_size_spls = chunk_size.checked_mul(num_ports).unwrap();
+
+    let rb_size_frames = num::NonZeroUsize::new(
+        RB_MIN_NUM_FRAMES
+            .get()
+            .checked_next_multiple_of(chunk_size.get())
+            .unwrap(),
+    )
+    .unwrap();
+
+    let rb_size_spls = rb_size_frames.checked_mul(num_ports).unwrap();
+
+    println!("Allocating Ring Buffer. Size = {rb_size_spls} samples");
+
+    let (mut tx, mut rx) = rtrb::RingBuffer::new(rb_size_spls.get());
 
     let network_thread = std::thread::current();
 
     let (jack_client, _status) =
         jack::Client::new("CLIENT", jack::ClientOptions::NO_START_SERVER).unwrap();
 
-    let ports = Box::from_iter((0..num_ports.get()).map(|i| {
+    let ports = Box::from_iter((1..=num_ports.get()).map(|i| {
         jack_client
             .register_port(&format!("input_{i}"), jack::AudioIn::default())
             .unwrap()
@@ -87,78 +144,65 @@ fn main() -> Result<(), Box<dyn Error>> {
     let mut port_buf_ptrs =
         Box::from_iter(iter::repeat_with(JackBufPtr::dangling).take(num_ports.get()));
 
-    let writer_async_client = jack::contrib::ClosureProcessHandler::with_state(
-        (),
-        move |_, _client, scope| {
-            READ_FROM_BUF.store(true, Ordering::Relaxed);
+    let writer_async_client = jack::contrib::ClosureProcessHandler::new(move |_client, scope| {
+        let Some(frames) = num::NonZeroUsize::new(scope.n_frames() as usize) else {
+            return jack::Control::Continue;
+        };
 
-            let mut remaining_frames = scope.n_frames() as usize;
+        for (port, ptr) in ports.iter().zip(&mut port_buf_ptrs) {
+            *ptr = JackBufPtr::from_slice(port.as_slice(scope));
+        }
 
-            for (port, ptr) in ports.iter().zip(&mut port_buf_ptrs) {
-                *ptr = JackBufPtr::from_slice(port.as_slice(scope));
-            }
+        let Ok(mut write_chunk) =
+            tx.write_chunk_uninit(num_ports.checked_mul(frames).unwrap().get())
+        else {
+            return jack::Control::Continue;
+        };
 
-            while let Some(rem) = NonZeroUsize::new(remaining_frames) {
-                let frames = CHUNK_SIZE_FRAMES.min(rem);
-                remaining_frames -= frames.get();
+        let (start, end) = write_chunk.as_mut_slices();
 
-                let Ok(mut write_chunk) =
-                    tx.write_chunk_uninit(num_ports.checked_mul(frames).unwrap().get())
-                else {
-                    continue;
-                };
+        let mut ptrs_iter = port_buf_ptrs.iter_mut();
 
-                let (start, end) = write_chunk.as_mut_slices();
+        for sample in iter::chain(start, end) {
+            let ptr = if let Some(ptr) = ptrs_iter.next() {
+                ptr
+            } else {
+                ptrs_iter = port_buf_ptrs.iter_mut();
+                ptrs_iter.next().unwrap()
+            };
 
-                let mut rb_chunk_iter = start.iter_mut().chain(end);
+            // SAFETY: buf is valid, and within the actual buffer's bounds
+            sample.write(unsafe { ptr.read() });
 
-                for _i in 0..frames.get() {
-                    // deinterleave chunk contents
+            // SAFETY: this happens at most `frames` times for this pointer, guaranteeing
+            // this stays within the buffer's bounds
+            unsafe { ptr.increment() };
+        }
 
-                    for buf in &mut port_buf_ptrs {
-                        // SAFETY: buf is valid, and within the actual buffer's bounds
-                        let sample = unsafe { buf.read() };
+        unsafe { write_chunk.commit_all() };
 
-                        // SAFETY: this happens at most `frames` times, guaranteeing this
-                        // stays within the buffer's bounds
-                        *buf = unsafe { buf.increment() };
+        if rb_size_spls.get() - tx.slots() >= chunk_size_spls.get() {
+            network_thread.unpark();
+        }
 
-                        rb_chunk_iter.next().unwrap().write(sample);
-                    }
-                }
+        jack::Control::Continue
+    });
 
-                unsafe { write_chunk.commit_all() };
-
-                if rb_size_samples.get() - tx.slots() >= net_chunk_size_spls.get() {
-                    network_thread.unpark();
-                }
-            }
-
-            jack::Control::Continue
-        },
-        |_, _client, _n_frames| {
-            READ_FROM_BUF.store(false, Ordering::Relaxed);
-            jack::Control::Continue
-        },
-    );
-
-    let _active_client = jack_client.activate_async((), writer_async_client).unwrap();
+    let _async_client = jack_client.activate_async((), writer_async_client).unwrap();
 
     loop {
-        let Ok(read_chunk) = rx.read_chunk(net_chunk_size_spls.get()) else {
+
+        let Ok(read_chunk) = rx.read_chunk(chunk_size_spls.get()) else {
             std::thread::park();
             continue;
         };
 
-        if READ_FROM_BUF.load(Ordering::Relaxed) {
-            // The other half is empty since always write in chunks of net_chunk_size_spls
-            let (slice, _) = read_chunk.as_slices();
+        // The other half is empty since RB_SIZE % CHUNK_SIZE = 0
+        let (slice, _) = read_chunk.as_slices();
 
-            // println!("{}", slice.iter().copied().map(f32::abs).max_by(f32::total_cmp).unwrap());
-            let slice = as_bytes(slice);
+        let slice = as_bytes(slice);
 
-            socket.send_to(slice, &addr).unwrap();
-        }
+        socket.send_to(slice, &addr).unwrap();
 
         read_chunk.commit_all();
     }
