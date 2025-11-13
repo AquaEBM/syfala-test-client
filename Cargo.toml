@@ -7,4 +7,3 @@ edition = "2024"
 
 rtrb = "0.3"
 jack = "0.13"
-arrayvec = "0.7"
