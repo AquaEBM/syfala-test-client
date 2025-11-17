@@ -8,9 +8,9 @@ use core::{
 };
 use std::io::{self, Read, Write};
 
-fn as_bytes<T>(data: &[T]) -> &[u8] {
+fn as_bytes(data: &[f32]) -> &[u8] {
     // SAFETY: all bit patterns for u8 are valid, references have same lifetime and location
-    unsafe { core::slice::from_raw_parts(data.as_ptr().cast(), size_of::<T>() * data.len()) }
+    unsafe { core::slice::from_raw_parts(data.as_ptr().cast(), size_of::<f32>() * data.len()) }
 }
 
 const PORT: u16 = 6910;
@@ -43,8 +43,9 @@ fn main() -> Result<(), Box<dyn Error>> {
     let n_ports_request = args
         .next()
         .as_deref()
-        .map(|s| s.parse().unwrap())
-        .unwrap_or(DEFAULT_N_PORTS.get());
+        .map(str::parse)
+        .unwrap_or(Ok(DEFAULT_N_PORTS))?
+        .get();
 
     println!("Connecting to SyFaLa Server at {addr}...");
     let mut stream = std::net::TcpStream::connect(&addr)?;
@@ -78,14 +79,11 @@ fn main() -> Result<(), Box<dyn Error>> {
         .unwrap()
         .min(MAX_SPLS_PER_DATAGRAM);
 
-    let rb_size_spls = RB_SIZE_FRAMES
-        .checked_mul(n_ports)
-        .unwrap()
-        .get();
+    let rb_size_spls = RB_SIZE_FRAMES.checked_mul(n_ports).unwrap().get();
 
     println!("Allocating Ring Buffer ({rb_size_spls} samples)");
 
-    let (mut tx, mut rx) = rtrb::RingBuffer::new(rb_size_spls);
+    let (mut tx, mut rx) = rtrb::RingBuffer::<f32>::new(rb_size_spls);
 
     let network_thread = std::thread::current();
 
@@ -93,8 +91,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     let (jack_client, _status) = jack::Client::new(
         &format!("SyFaLa\n{}\n{}", addr.ip(), addr.port()),
         jack::ClientOptions::NO_START_SERVER,
-    )
-    .unwrap();
+    )?;
 
     let ports = Box::from_iter((1..=n_ports.get()).map(|i| {
         jack_client
@@ -112,10 +109,10 @@ fn main() -> Result<(), Box<dyn Error>> {
         let slots = tx.slots().min(n_ports.checked_mul(frames).unwrap().get());
         let mut write_chunk = tx.write_chunk_uninit(slots).unwrap();
 
-        if let Err(_e) = interleaver.interleaver(
+        if let Err(_e) = interleaver.interleave(
             frames.get(),
             ports.iter().map(|p| p.as_slice(scope)),
-            write_chunk.as_mut_slices().into()
+            write_chunk.as_mut_slices().into(),
         ) {
             return jack::Control::Quit;
         }
@@ -128,14 +125,14 @@ fn main() -> Result<(), Box<dyn Error>> {
     });
 
     println!("Starting JACK client...\n");
-    let _async_client = jack_client.activate_async((), async_client).unwrap();
+    let _async_client = jack_client.activate_async((), async_client)?;
 
     println!("Creating UDP Socket...");
-    let socket = std::net::UdpSocket::bind(stream.local_addr().unwrap()).unwrap();
+    let socket = std::net::UdpSocket::bind(stream.local_addr()?)?;
     socket.connect(&addr)?;
 
     let mut packet_idx: u32 = 0;
-    
+
     // index of the last sent sample within the current server chunk
     let mut chunk_sample_idx: usize = 0;
 
@@ -144,17 +141,17 @@ fn main() -> Result<(), Box<dyn Error>> {
     println!("Starting UDP client...\n");
 
     loop {
-
         let slots = rx.slots().min(MAX_SPLS_PER_DATAGRAM.get());
 
         // the number of samples left to fill the current server chunk
         let required_samples = chunk_size_spls.get() - chunk_sample_idx;
 
         if slots < required_samples {
-            println!("waiting for samples...");
             std::thread::park();
             continue;
         }
+
+        scratch_buffer.clear();
 
         // Reinterpreted back as a u32 by the server.
         scratch_buffer.push(f32::from_bits(packet_idx));
@@ -165,8 +162,12 @@ fn main() -> Result<(), Box<dyn Error>> {
         scratch_buffer.extend_from_slice(end);
         rb_chunk.commit_all();
 
-        socket.send(as_bytes(scratch_buffer.as_slice()))?;
-        scratch_buffer.clear();
+        let bytes = as_bytes(scratch_buffer.as_slice());
+
+        if socket.send(bytes)? < bytes.len() {
+            eprintln!("WARNING: partially dropped datagram");
+        }
+
         packet_idx = packet_idx.wrapping_add(1);
 
         chunk_sample_idx += slots;

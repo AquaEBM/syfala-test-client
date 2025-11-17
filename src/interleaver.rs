@@ -27,7 +27,7 @@ pub enum InterleaveError {
 }
 
 impl<T: Clone> Interleaver<T> {
-    pub fn interleaver<'a>(
+    pub fn interleave<'a>(
         &'a mut self,
         n_frames: usize,
         slices: impl ExactSizeIterator<Item = &'a [T]>,
