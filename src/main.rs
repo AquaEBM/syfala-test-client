@@ -1,28 +1,53 @@
 mod interleaver;
 
 use core::{
-    cmp,
+    cell, cmp,
     error::Error,
+    iter,
     net::{IpAddr, Ipv4Addr},
     num,
 };
 use std::io::{self, Read, Write};
 
-fn as_bytes(data: &[f32]) -> &[u8] {
-    // SAFETY: all bit patterns for u8 are valid, references have same lifetime and location
-    unsafe { core::slice::from_raw_parts(data.as_ptr().cast(), size_of::<f32>() * data.len()) }
+const fn as_bytes(data: &[Sample]) -> &[u8] {
+    // SAFETY: all bit patterns for u8 are valid, references have same lifetime
+    unsafe {
+        core::slice::from_raw_parts(
+            data.as_ptr().cast(),
+            data.len().strict_mul(SAMPLE_SIZE.get()),
+        )
+    }
 }
 
-const PORT: u16 = 6910;
+const fn nz(x: usize) -> num::NonZeroUsize {
+    num::NonZeroUsize::new(x).unwrap()
+}
+
+const DEFAULT_PORT: u16 = 6910;
+
+type Sample = f32;
+const SILENCE: Sample = 0.;
+
+const SAMPLE_SIZE: num::NonZeroUsize = nz(size_of::<Sample>());
+
+const SAMPLE_RATE: f64 = 48000.;
 
 // This has to be big enough to accomodate at least a couple of process cycles
-// Needless to say, those can have very high buffer sizes. One second is usually enough
-const RB_SIZE_FRAMES: num::NonZeroUsize = num::NonZeroUsize::new(1 << 16).unwrap();
+// Needless to say, those can reach very high buffer sizes.
+// We choose four seconds here
+const RB_SIZE_SECONDS: f64 = 4.;
 
-const MAX_SPLS_PER_DATAGRAM: num::NonZeroUsize = num::NonZeroUsize::new(362).unwrap();
+const RB_SIZE_FRAMES: num::NonZeroUsize = nz((SAMPLE_RATE * RB_SIZE_SECONDS) as usize);
 
-// 1
-const DEFAULT_N_PORTS: num::NonZeroUsize = num::NonZeroUsize::MIN;
+const MAX_DATAGRAM_SIZE: num::NonZeroUsize = nz(1452);
+
+const MAX_SAMPLE_DATA_PER_DATAGRAM: num::NonZeroUsize =
+    nz(MAX_DATAGRAM_SIZE.get().strict_sub(size_of::<u64>()));
+
+const MAX_SPLS_PER_DATAGRAM: num::NonZeroUsize =
+    nz(MAX_SAMPLE_DATA_PER_DATAGRAM.get() / SAMPLE_SIZE.get());
+
+const DEFAULT_N_PORTS: num::NonZeroUsize = num::NonZeroUsize::MIN; // AKA 1
 
 fn read_exact_array<const N: usize>(reader: &mut (impl Read + ?Sized)) -> io::Result<[u8; N]> {
     let mut buf = [0; N];
@@ -37,7 +62,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             .as_deref()
             .map(str::parse)
             .unwrap_or(Ok(IpAddr::V4(Ipv4Addr::LOCALHOST)))?,
-        PORT,
+        DEFAULT_PORT,
     );
 
     let n_ports_request = args
@@ -74,16 +99,11 @@ fn main() -> Result<(), Box<dyn Error>> {
         return Err("Attempted to create a client with 0 ports".into());
     };
 
-    let chunk_size_spls = chunk_size_frames
-        .checked_mul(n_ports)
-        .unwrap()
-        .min(MAX_SPLS_PER_DATAGRAM);
-
     let rb_size_spls = RB_SIZE_FRAMES.checked_mul(n_ports).unwrap().get();
 
     println!("Allocating Ring Buffer ({rb_size_spls} samples)");
 
-    let (mut tx, mut rx) = rtrb::RingBuffer::<f32>::new(rb_size_spls);
+    let (mut tx, mut rx) = rtrb::RingBuffer::<Sample>::new(rb_size_spls);
 
     let network_thread = std::thread::current();
 
@@ -99,26 +119,82 @@ fn main() -> Result<(), Box<dyn Error>> {
             .unwrap()
     }));
 
-    let mut interleaver = interleaver::Interleaver::new(n_ports.get());
+    let mut interleaver = interleaver::Interleaver::<Sample>::new(n_ports.get());
+
+    // lol
+    let mut frame_counter = cell::OnceCell::new();
 
     let async_client = jack::contrib::ClosureProcessHandler::new(move |_client, scope| {
-        let Some(frames) = num::NonZeroUsize::new(scope.n_frames() as usize) else {
+        let Some(current_cycle_frames) = num::NonZeroUsize::new(scope.n_frames() as usize) else {
             return jack::Control::Continue;
         };
 
-        let slots = tx.slots().min(n_ports.checked_mul(frames).unwrap().get());
-        let mut write_chunk = tx.write_chunk_uninit(slots).unwrap();
+        let last_frame_time = scope.last_frame_time();
+
+        // NIGHTLY: #[feature(once_cell_mut)], use get_or_init_mut
+        let _ = frame_counter.get_or_init(|| last_frame_time);
+        let frame_counter = frame_counter.get_mut().unwrap();
+
+        // Number of missed frames since the previous cycle
+        let n_missed_frames = last_frame_time.wrapping_sub(*frame_counter) as usize;
+
+        if n_missed_frames > 1000 {
+            println!(
+                "hehehee {n_missed_frames}, last: {last_frame_time}, now {frame_counter}, frames: {current_cycle_frames}"
+            );
+        }
+
+        // Number of frames we want this cycle
+        // The first frames_missed frames will be filled with zeros
+        let n_requested_frames = current_cycle_frames.checked_add(n_missed_frames).unwrap();
+        // We must always send whole frames (hence the floor division)
+        let n_available_frames = tx.slots() / n_ports;
+
+        // Number of frames available in the ring buffer
+        // This should always be equal to requested_frames. If it isn't,
+        // our ring buffer is too small, or our network thread is stalling...
+        let n_read_frames = n_available_frames.min(n_requested_frames.get());
+
+        // Number of frames that will actually be filled with zeros
+        let n_zero_filled_frames = n_missed_frames.min(n_read_frames);
+        let n_zero_filled_samples = n_zero_filled_frames.strict_mul(n_ports.get());
+
+        let n_written_frames = n_read_frames.strict_sub(n_zero_filled_frames);
+
+        let mut write_chunk = tx
+            .write_chunk_uninit(n_read_frames.strict_mul(n_ports.get()))
+            .unwrap();
+
+        let (start, end) = write_chunk.as_mut_slices();
+
+        // Split the ring buffer slices into two parts, the first one will be filled with
+        // zeros, we will write into the rest as much of this cycle's data as we can
+
+        let start_zero_filled_len = start.len().min(n_zero_filled_samples);
+        let end_zero_filled_len = n_zero_filled_samples.strict_sub(start_zero_filled_len);
+
+        let (start_zero_filled, start_samples) = start.split_at_mut(start_zero_filled_len);
+        let (end_zero_filled, end_samples) = end.split_at_mut(end_zero_filled_len);
+
+        // NIGHTLY: #[feature(maybe_uninit_fill)], use write_filled
+        for s in iter::chain(start_zero_filled, end_zero_filled) {
+            s.write(SILENCE);
+        }
 
         if let Err(_e) = interleaver.interleave(
-            frames.get(),
+            n_written_frames,
             ports.iter().map(|p| p.as_slice(scope)),
-            write_chunk.as_mut_slices().into(),
+            [start_samples, end_samples],
         ) {
+            // reaching here is an irrecoverable bug! exit...
             return jack::Control::Quit;
         }
 
         unsafe { write_chunk.commit_all() };
 
+        *frame_counter = frame_counter.wrapping_add(n_read_frames as u32);
+
+        // Is this necessary?
         network_thread.unpark();
 
         jack::Control::Continue
@@ -127,50 +203,49 @@ fn main() -> Result<(), Box<dyn Error>> {
     println!("Starting JACK client...\n");
     let _async_client = jack_client.activate_async((), async_client)?;
 
-    println!("Creating UDP Socket...");
+    println!("Starting UDP client...");
     let socket = std::net::UdpSocket::bind(stream.local_addr()?)?;
     socket.connect(&addr)?;
 
-    let mut packet_idx: u32 = 0;
+    // Keep track of the number of samples sent, samples, not frames, we allow sending
+    // incomplete frames in a packet to account for very high channel count scenarios
+    let mut current_sample_idx = 0u64;
 
-    // index of the last sent sample within the current server chunk
-    let mut chunk_sample_idx: usize = 0;
+    let chunk_size_spls = n_ports.checked_mul(chunk_size_frames).unwrap();
 
-    let mut scratch_buffer = Vec::with_capacity(MAX_SPLS_PER_DATAGRAM.get() + 1);
-
-    println!("Starting UDP client...\n");
+    // Here is where we'll write the packets sent over UDP
+    let mut scratch_buf = arrayvec::ArrayVec::<u8, { MAX_DATAGRAM_SIZE.get() }>::new_const();
 
     loop {
-        let slots = rx.slots().min(MAX_SPLS_PER_DATAGRAM.get());
+        scratch_buf.clear();
+        scratch_buf.extend(current_sample_idx.to_be_bytes());
 
-        // the number of samples left to fill the current server chunk
-        let required_samples = chunk_size_spls.get() - chunk_sample_idx;
+        // Number of samples left to fill the next server chunk
+        let n_remaining_chunk_spls = nz(chunk_size_spls
+            .get()
+            .strict_sub(current_sample_idx as usize % chunk_size_spls));
 
-        if slots < required_samples {
+        // If it's greater than the allowed size of a datagram, split the samples
+        let n_samples_to_send = n_remaining_chunk_spls.min(MAX_SPLS_PER_DATAGRAM);
+
+        if rx.slots() < n_samples_to_send.get() {
             std::thread::park();
             continue;
         }
 
-        scratch_buffer.clear();
+        let rb_chunk = rx.read_chunk(n_samples_to_send.get()).unwrap();
 
-        // Reinterpreted back as a u32 by the server.
-        scratch_buffer.push(f32::from_bits(packet_idx));
-
-        let rb_chunk = rx.read_chunk(slots).unwrap();
         let (start, end) = rb_chunk.as_slices();
-        scratch_buffer.extend_from_slice(start);
-        scratch_buffer.extend_from_slice(end);
+        scratch_buf.try_extend_from_slice(as_bytes(start)).unwrap();
+        scratch_buf.try_extend_from_slice(as_bytes(end)).unwrap();
         rb_chunk.commit_all();
 
-        let bytes = as_bytes(scratch_buffer.as_slice());
+        let bytes_sent = socket.send(scratch_buf.as_slice())?;
 
-        if socket.send(bytes)? < bytes.len() {
+        if bytes_sent < scratch_buf.len() {
             eprintln!("WARNING: partially dropped datagram");
         }
 
-        packet_idx = packet_idx.wrapping_add(1);
-
-        chunk_sample_idx += slots;
-        chunk_sample_idx %= chunk_size_spls;
+        current_sample_idx = current_sample_idx.wrapping_add(n_samples_to_send.get() as u64);
     }
 }

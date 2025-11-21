@@ -10,7 +10,6 @@ pub struct Interleaver<T> {
 unsafe impl<T: Send + Sync> Send for Interleaver<T> {}
 
 impl<T> Interleaver<T> {
-
     pub fn new(len: usize) -> Box<Self> {
         let boxed_slice = Box::from_iter(iter::repeat_with(NonNull::<T>::dangling).take(len));
 
@@ -23,7 +22,7 @@ impl<T> Interleaver<T> {
 pub enum InterleaveError {
     IncorrectInputSliceLen,
     IncorrectOutputSliceLen,
-    IncorrectInputSliceCount
+    IncorrectInputSliceCount,
 }
 
 impl<T: Clone> Interleaver<T> {
@@ -31,9 +30,8 @@ impl<T: Clone> Interleaver<T> {
         &'a mut self,
         n_frames: usize,
         slices: impl ExactSizeIterator<Item = &'a [T]>,
-        output_slices: [&mut [mem::MaybeUninit<T>] ; 2],
-    ) -> Result<() , InterleaveError> {
-
+        output_slices: [&mut [mem::MaybeUninit<T>]; 2],
+    ) -> Result<(), InterleaveError> {
         // write the pointers into our list
 
         let mut n_slices = 0;
@@ -61,10 +59,9 @@ impl<T: Clone> Interleaver<T> {
 
         for _ in 0..n_frames {
             for ptr in &mut self.ptrs {
-
                 let val = unsafe { output_slice_iter.next().unwrap_unchecked() };
 
-                // SAFETY: ptr is within the bounds of a slice live for at least this whole function
+                // SAFETY: ptr points to a slice live for at least this whole function
                 val.write(unsafe { ptr.as_ref() }.clone());
 
                 // SAFETY: This is called at most n_frames times, making it within
