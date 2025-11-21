@@ -135,17 +135,16 @@ fn main() -> Result<(), Box<dyn Error>> {
         let _ = frame_counter_cell.get_or_init(|| last_frame_time);
         let frame_counter = frame_counter_cell.get_mut().unwrap();
 
-        // Wrapping arithmetic is fine here if it is guaranteed that last_frame_time
-        // increases monotonically While the docs do, such isn't always the case
-        let n_missed_frames = last_frame_time.wrapping_sub(*frame_counter);
+        // Wrapping arithmetic would be fine here if it is guaranteed that last_frame_time
+        // increases monotonically. While the docs do, such isn't always the case.
+        // This would also freeze the processing if we hit numerical limits
+        // which aren't that huge (u32) (another jack issue)
+        let Some(n_missed_frames) = last_frame_time.checked_sub(*frame_counter) else {
+            eprintln!("WARNING: reordered JACK cycles...");
+            return jack::Control::Continue;
+        };
 
         let n_missed_frames = n_missed_frames as usize;
-
-        if n_missed_frames > 1000 {
-            println!(
-                "hehehee {n_missed_frames}, last: {last_frame_time}, now {frame_counter}, frames: {current_cycle_frames}"
-            );
-        }
 
         // Number of frames we want this cycle
         // The first frames_missed frames will be filled with zeros
