@@ -122,7 +122,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     let mut interleaver = interleaver::Interleaver::<Sample>::new(n_ports.get());
 
     // lol
-    let mut frame_counter = cell::OnceCell::new();
+    let mut frame_counter_cell = cell::OnceCell::new();
 
     let async_client = jack::contrib::ClosureProcessHandler::new(move |_client, scope| {
         let Some(current_cycle_frames) = num::NonZeroUsize::new(scope.n_frames() as usize) else {
@@ -132,11 +132,14 @@ fn main() -> Result<(), Box<dyn Error>> {
         let last_frame_time = scope.last_frame_time();
 
         // NIGHTLY: #[feature(once_cell_mut)], use get_or_init_mut
-        let _ = frame_counter.get_or_init(|| last_frame_time);
-        let frame_counter = frame_counter.get_mut().unwrap();
+        let _ = frame_counter_cell.get_or_init(|| last_frame_time);
+        let frame_counter = frame_counter_cell.get_mut().unwrap();
 
-        // Number of missed frames since the previous cycle
-        let n_missed_frames = last_frame_time.wrapping_sub(*frame_counter) as usize;
+        // Wrapping arithmetic is fine here if it is guaranteed that last_frame_time
+        // increases monotonically While the docs do, such isn't always the case
+        let n_missed_frames = last_frame_time.wrapping_sub(*frame_counter);
+
+        let n_missed_frames = n_missed_frames as usize;
 
         if n_missed_frames > 1000 {
             println!(
